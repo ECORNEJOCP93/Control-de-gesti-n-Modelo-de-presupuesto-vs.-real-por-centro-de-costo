@@ -1,1 +1,74 @@
+USE Pdan8_Presupuesto;
+GO
 
+CREATE TABLE CUENTAS(
+    id_cuenta INT IDENTITY(1,1) PRIMARY KEY,
+    codigo_cuenta VARCHAR(20) NOT NULL,
+    nombre_cuenta VARCHAR(55) NOT NULL,
+    tipo_cuenta VARCHAR(55) NOT NULL,
+    naturaleza VARCHAR(30) NOT NULL,
+    CONSTRAINT UQ_Cuentas_codigo UNIQUE (codigo_cuenta),
+    CONSTRAINT CK_Cuentas_tipo CHECK (tipo_cuenta IN ('Ingreso','Gasto')),
+    CONSTRAINT CK_Cuentas_naturaleza CHECK (naturaleza IN ('Fijo','Variable'))
+);
+
+CREATE TABLE PERIODOS(
+    id_periodo INT IDENTITY(1,1) PRIMARY KEY,
+    anio INT NOT NULL,
+    mes INT NOT NULL,
+    trimestre INT NOT NULL,
+    CONSTRAINT UQ_Periodos_anio_mes UNIQUE (anio, mes),
+    CONSTRAINT CK_Periodos_mes CHECK (mes BETWEEN 1 AND 12),
+    CONSTRAINT CK_Periodos_trimestre CHECK (trimestre BETWEEN 1 AND 4)
+);
+
+CREATE TABLE VERSIONPRESUPUESTO(
+    id_version INT IDENTITY(1,1) PRIMARY KEY,
+    nombre_version VARCHAR(55) NOT NULL,
+    fecha_aprobacion DATE,
+    CONSTRAINT UQ_Version_nombre UNIQUE (nombre_version)
+);
+
+CREATE TABLE AREAS(
+    id_area INT IDENTITY(1,1) PRIMARY KEY,
+    nombre_area VARCHAR(55) NOT NULL,
+    gerencia VARCHAR(55) NOT NULL,
+    CONSTRAINT UQ_Areas_nombre UNIQUE (nombre_area)
+);
+
+CREATE TABLE CENTRO_COSTO(
+    id_centro_costo INT IDENTITY(1,1) PRIMARY KEY,
+    codigo VARCHAR(15) NOT NULL,
+    nombre VARCHAR(55) NOT NULL,
+    id_area INT NOT NULL,
+    responsable VARCHAR(100),
+    CONSTRAINT UQ_CentroCosto_codigo UNIQUE (codigo),
+    CONSTRAINT FK_CentroCosto_Areas FOREIGN KEY (id_area) REFERENCES AREAS (id_area)
+);
+
+CREATE TABLE GASTO_REAL(
+    id_real INT IDENTITY(1,1) PRIMARY KEY,
+    id_centro_costo INT NOT NULL,
+    id_cuenta INT NOT NULL,
+    id_periodo INT NOT NULL,
+    documento_origen VARCHAR(55) NOT NULL,
+    fecha_registro DATE NOT NULL,
+    monto_real DECIMAL(20,2) NOT NULL,
+    CONSTRAINT FK_GastoReal_CentroCosto FOREIGN KEY (id_centro_costo) REFERENCES CENTRO_COSTO (id_centro_costo),
+    CONSTRAINT FK_GastoReal_Periodo FOREIGN KEY (id_periodo) REFERENCES PERIODOS (id_periodo),
+    CONSTRAINT FK_GastoReal_Cuenta FOREIGN KEY (id_cuenta) REFERENCES CUENTAS (id_cuenta)
+);
+
+CREATE TABLE PRESUPUESTO(
+    id_presupuesto INT IDENTITY(1,1) PRIMARY KEY,
+    id_centro_costo INT NOT NULL,
+    id_cuenta INT NOT NULL,
+    id_periodo INT NOT NULL,
+    id_version INT NOT NULL,
+    monto_presupuesto DECIMAL(20,2) NOT NULL,
+    CONSTRAINT UQ_Presupuesto_combo UNIQUE (id_centro_costo, id_cuenta, id_periodo, id_version),
+    CONSTRAINT FK_Presupuesto_CentroCosto FOREIGN KEY (id_centro_costo) REFERENCES CENTRO_COSTO (id_centro_costo),
+    CONSTRAINT FK_Presupuesto_Cuenta FOREIGN KEY (id_cuenta) REFERENCES CUENTAS (id_cuenta),
+    CONSTRAINT FK_Presupuesto_Periodo FOREIGN KEY (id_periodo) REFERENCES PERIODOS (id_periodo),
+    CONSTRAINT FK_Presupuesto_Version FOREIGN KEY (id_version) REFERENCES VERSIONPRESUPUESTO (id_version)
+);
