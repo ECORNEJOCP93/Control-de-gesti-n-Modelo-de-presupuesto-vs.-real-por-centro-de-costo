@@ -1,1 +1,212 @@
+USE Pdan8_Presupuesto;
+GO
+
+SET NOCOUNT ON;
+
+/* ---------- 0. Limpieza (orden inverso a las dependencias) ---------- */
+DELETE FROM PRESUPUESTO;
+DELETE FROM GASTO_REAL;
+DELETE FROM CENTRO_COSTO;
+DELETE FROM AREAS;
+DELETE FROM VERSIONPRESUPUESTO;
+DELETE FROM PERIODOS;
+DELETE FROM CUENTAS;
+GO
+
+/* ---------- 1. Areas ---------- */
+INSERT INTO AREAS (nombre_area, gerencia) VALUES
+(N'Comercial',               N'Gerencia Comercial'),
+(N'Marketing',               N'Gerencia Comercial'),
+(N'Producción',              N'Gerencia de Operaciones'),
+(N'Logística',               N'Gerencia de Operaciones'),
+(N'Finanzas',                N'Gerencia de Administración y Finanzas'),
+(N'Recursos Humanos',        N'Gerencia de Administración y Finanzas');
+
+/* ---------- 2. Cuentas (10 de gasto + 2 de ingreso) ---------- */
+INSERT INTO CUENTAS (codigo_cuenta, nombre_cuenta, tipo_cuenta, naturaleza) VALUES
+('6211', N'Sueldos y salarios',            'Gasto',   'Fijo'),
+('6271', N'Seguridad social',              'Gasto',   'Fijo'),
+('6321', N'Servicios de asesoría',         'Gasto',   'Variable'),
+('6351', N'Alquileres',                    'Gasto',   'Fijo'),
+('6361', N'Servicios básicos',             'Gasto',   'Variable'),
+('6371', N'Publicidad y marketing',        'Gasto',   'Variable'),
+('6381', N'Mantenimiento y reparaciones',  'Gasto',   'Variable'),
+('6411', N'Transporte y logística',        'Gasto',   'Variable'),
+('6561', N'Suministros de oficina',        'Gasto',   'Variable'),
+('6591', N'Viáticos y movilidad',          'Gasto',   'Variable'),
+('7011', N'Venta de productos terminados', 'Ingreso', 'Variable'),
+('7041', N'Venta de servicios',            'Ingreso', 'Variable');
+
+/* ---------- 3. Periodos (2026, 12 meses) ---------- */
+INSERT INTO PERIODOS (anio, mes, trimestre)
+SELECT 2026, t.m, (t.m - 1) / 3 + 1
+FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12)) AS t(m);
+
+/* ---------- 4. Versiones de presupuesto ---------- */
+INSERT INTO VERSIONPRESUPUESTO (nombre_version, fecha_aprobacion) VALUES
+(N'Presupuesto inicial', '2025-12-15'),
+(N'Forecast Q3',         '2026-07-10');
+
+/* ---------- 5. Centros de costo (10) ---------- */
+INSERT INTO CENTRO_COSTO (codigo, nombre, id_area, responsable)
+SELECT v.codigo, v.nombre, a.id_area, v.responsable
+FROM (VALUES
+    ('CC-101', N'Ventas Lima',               N'Comercial',        N'Carlos Mendoza'),
+    ('CC-102', N'Ventas Provincias',         N'Comercial',        N'Lucía Ramírez'),
+    ('CC-201', N'Marketing Digital',         N'Marketing',        N'Jorge Paredes'),
+    ('CC-202', N'Trade Marketing',           N'Marketing',        N'Mariela Torres'),
+    ('CC-301', N'Planta Lurín',              N'Producción',       N'Diego Salazar'),
+    ('CC-302', N'Control de Calidad',        N'Producción',       N'Karina Flores'),
+    ('CC-401', N'Almacén Central',           N'Logística',        N'Renato Quispe'),
+    ('CC-402', N'Transporte y Distribución', N'Logística',        N'Patricia Vargas'),
+    ('CC-501', N'Contabilidad y Tesorería',  N'Finanzas',         N'Héctor Rojas'),
+    ('CC-601', N'Gestión del Talento',       N'Recursos Humanos', N'Andrea Castillo')
+) AS v(codigo, nombre, area, responsable)
+INNER JOIN AREAS AS a
+    ON a.nombre_area = v.area;
+
+/* ---------- 6. Tablas auxiliares (numeran los IDs reales 1..N) ---------- */
+DROP TABLE IF EXISTS #cc;
+DROP TABLE IF EXISTS #cu;
+DROP TABLE IF EXISTS #pe;
+DROP TABLE IF EXISTS #alea;
+
+-- escala: tamaño relativo del centro | sesgo: tendencia del gasto real vs. presupuesto
+CREATE TABLE #cc (rn INT PRIMARY KEY, id INT, escala DECIMAL(4,2), sesgo DECIMAL(4,2));
+INSERT INTO #cc (rn, id, escala, sesgo)
+SELECT ROW_NUMBER() OVER (ORDER BY id_centro_costo),
+       id_centro_costo,
+       CASE codigo WHEN 'CC-301' THEN 2.00 WHEN 'CC-402' THEN 1.50 WHEN 'CC-101' THEN 1.20
+                   WHEN 'CC-501' THEN 0.70 WHEN 'CC-601' THEN 0.60 ELSE 1.00 END,
+       CASE codigo WHEN 'CC-201' THEN 1.25    -- Marketing Digital: se sobreejecuta
+                   WHEN 'CC-402' THEN 1.30    -- Transporte y Distribucion: se sobreejecuta
+                   WHEN 'CC-302' THEN 0.70    -- Control de Calidad: subejecuta
+                   ELSE 1.00 END
+FROM CENTRO_COSTO;
+
+-- base: monto mensual tipico de cada cuenta de gasto
+CREATE TABLE #cu (rn INT PRIMARY KEY, id INT, base DECIMAL(12,2));
+INSERT INTO #cu (rn, id, base)
+SELECT ROW_NUMBER() OVER (ORDER BY id_cuenta),
+       id_cuenta,
+       CASE codigo_cuenta
+            WHEN '6211' THEN 40000 WHEN '6271' THEN 4000  WHEN '6321' THEN 9000
+            WHEN '6351' THEN 12000 WHEN '6361' THEN 3500  WHEN '6371' THEN 15000
+            WHEN '6381' THEN 6000  WHEN '6411' THEN 18000 WHEN '6561' THEN 1800
+            WHEN '6591' THEN 2500  END
+FROM CUENTAS
+WHERE tipo_cuenta = 'Gasto';
+
+CREATE TABLE #pe (rn INT PRIMARY KEY, id INT, anio INT, mes INT);
+INSERT INTO #pe (rn, id, anio, mes)
+SELECT ROW_NUMBER() OVER (ORDER BY anio, mes), id_periodo, anio, mes
+FROM PERIODOS;
+
+DECLARE @id_inicial  INT = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Presupuesto inicial');
+DECLARE @id_forecast INT = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Forecast Q3');
+DECLARE @n_cc INT = (SELECT COUNT(*) FROM #cc);
+DECLARE @n_cu INT = (SELECT COUNT(*) FROM #cu);
+
+/* ---------- 7. PRESUPUESTO ---------- */
+-- 7.1 Presupuesto inicial: todos los centros x cuentas de gasto x 12 meses (10 x 10 x 12 = 1200)
+INSERT INTO PRESUPUESTO (id_centro_costo, id_cuenta, id_periodo, id_version, monto_presupuesto)
+SELECT cc.id, cu.id, pe.id, @id_inicial,
+       CAST(cu.base * cc.escala * (0.80 + (ABS(CHECKSUM(NEWID())) % 41) / 100.0) AS DECIMAL(20,2))
+FROM #cc AS cc
+CROSS JOIN #cu AS cu
+CROSS JOIN #pe AS pe;
+
+-- 7.2 Forecast Q3: revisa una muestra de jul-dic (entre 250 y 350 filas -> total 1450 a 1550)
+DECLARE @n_forecast INT = 250 + ABS(CHECKSUM(NEWID())) % 101;
+
+INSERT INTO PRESUPUESTO (id_centro_costo, id_cuenta, id_periodo, id_version, monto_presupuesto)
+SELECT TOP (@n_forecast)
+       p.id_centro_costo, p.id_cuenta, p.id_periodo, @id_forecast,
+       CAST(p.monto_presupuesto * (0.90 + (ABS(CHECKSUM(NEWID())) % 36) / 100.0) AS DECIMAL(20,2))
+FROM PRESUPUESTO AS p
+INNER JOIN PERIODOS AS pr
+    ON pr.id_periodo = p.id_periodo
+WHERE p.id_version = @id_inicial
+  AND pr.mes >= 7
+ORDER BY NEWID();
+
+/* ---------- 8. GASTO_REAL (ene-sep 2026, entre 1450 y 1550 filas) ---------- */
+DECLARE @meses_real INT = 9;                                   -- ultimo mes cerrado
+DECLARE @n_real     INT = 1450 + ABS(CHECKSUM(NEWID())) % 101;
+
+-- Se guardan los numeros aleatorios en una tabla temporal para que cada fila
+-- los conserve (si no, SQL Server podria recalcular NEWID() en cada referencia).
+SELECT TOP (@n_real)
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))  AS k,
+       ABS(CHECKSUM(NEWID())) % @n_cc + 1          AS rn_cc,
+       ABS(CHECKSUM(NEWID())) % @n_cu + 1          AS rn_cu,
+       ABS(CHECKSUM(NEWID())) % @meses_real + 1    AS rn_pe,
+       ABS(CHECKSUM(NEWID())) % 31                 AS r_monto,
+       ABS(CHECKSUM(NEWID())) % 28                 AS r_dia,
+       ABS(CHECKSUM(NEWID())) % 3 + 1              AS r_doc
+INTO #alea
+FROM sys.all_objects AS a
+CROSS JOIN sys.all_objects AS b;
+
+-- Un mismo centro/cuenta/mes puede tener varios documentos; el monto de cada uno
+-- se reparte para que la suma quede cerca del presupuesto (x sesgo del centro).
+DECLARE @divisor DECIMAL(10,4) = @n_real * 1.0 / (@n_cc * @n_cu * @meses_real);
+
+INSERT INTO GASTO_REAL (id_centro_costo, id_cuenta, id_periodo, documento_origen, fecha_registro, monto_real)
+SELECT cc.id, cu.id, pe.id,
+       CONCAT(CHOOSE(a.r_doc, 'FAC', 'BOL', 'REC'), '-',
+              pe.anio, RIGHT('00' + CAST(pe.mes AS VARCHAR(2)), 2), '-',
+              RIGHT('00000' + CAST(a.k AS VARCHAR(5)), 5)),
+       DATEADD(DAY, a.r_dia, DATEFROMPARTS(pe.anio, pe.mes, 1)),
+       CAST(pr.monto_presupuesto * cc.sesgo * (0.85 + a.r_monto / 100.0) / @divisor AS DECIMAL(20,2))
+FROM #alea AS a
+INNER JOIN #cc AS cc ON cc.rn = a.rn_cc
+INNER JOIN #cu AS cu ON cu.rn = a.rn_cu
+INNER JOIN #pe AS pe ON pe.rn = a.rn_pe
+INNER JOIN PRESUPUESTO AS pr
+        ON pr.id_centro_costo = cc.id
+       AND pr.id_cuenta       = cu.id
+       AND pr.id_periodo      = pe.id
+       AND pr.id_version      = @id_inicial;
+
+DROP TABLE #cc;
+DROP TABLE #cu;
+DROP TABLE #pe;
+DROP TABLE #alea;
+
+/* ---------- 9. Verificacion ---------- */
+-- 9.1 Filas por tabla
+SELECT 'AREAS' AS tabla, COUNT(*) AS filas FROM AREAS
+UNION ALL SELECT 'CENTRO_COSTO',       COUNT(*) FROM CENTRO_COSTO
+UNION ALL SELECT 'CUENTAS',            COUNT(*) FROM CUENTAS
+UNION ALL SELECT 'PERIODOS',           COUNT(*) FROM PERIODOS
+UNION ALL SELECT 'VERSIONPRESUPUESTO', COUNT(*) FROM VERSIONPRESUPUESTO
+UNION ALL SELECT 'PRESUPUESTO',        COUNT(*) FROM PRESUPUESTO
+UNION ALL SELECT 'GASTO_REAL',         COUNT(*) FROM GASTO_REAL;
+
+-- 9.2 Desviacion por centro de costo (presupuesto inicial vs. real, ene-sep).
+-- Cada tabla se agrega por separado antes de unirla para no duplicar montos.
+WITH pres AS (
+    SELECT p.id_centro_costo, SUM(p.monto_presupuesto) AS presupuesto
+    FROM PRESUPUESTO AS p
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = p.id_periodo
+    WHERE p.id_version = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Presupuesto inicial')
+      AND pe.mes <= 9
+    GROUP BY p.id_centro_costo
+),
+gasto AS (
+    SELECT id_centro_costo, SUM(monto_real) AS gasto_real
+    FROM GASTO_REAL
+    GROUP BY id_centro_costo
+)
+SELECT cc.codigo,
+       cc.nombre,
+       pr.presupuesto,
+       g.gasto_real,
+       g.gasto_real - pr.presupuesto AS desviacion,
+       CAST(100.0 * (g.gasto_real - pr.presupuesto) / NULLIF(pr.presupuesto, 0) AS DECIMAL(6,1)) AS pct_desviacion
+FROM CENTRO_COSTO AS cc
+INNER JOIN pres  AS pr ON pr.id_centro_costo = cc.id_centro_costo
+LEFT  JOIN gasto AS g  ON g.id_centro_costo  = cc.id_centro_costo
+ORDER BY pct_desviacion DESC;
 
