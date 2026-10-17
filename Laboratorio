@@ -1,1 +1,358 @@
+USE Pdan8_Presupuesto;
+GO
 
+/*1. Presupuesto inicial anual por área y centro*/
+
+SELECT a.nombre_area,
+       cc.codigo,
+       cc.nombre AS centro_costo,
+       SUM(p.monto_presupuesto) AS presupuesto_anual
+FROM PRESUPUESTO AS p
+INNER JOIN VERSIONPRESUPUESTO AS v  ON v.id_version      = p.id_version
+INNER JOIN PERIODOS           AS pe ON pe.id_periodo     = p.id_periodo
+INNER JOIN CENTRO_COSTO       AS cc ON cc.id_centro_costo = p.id_centro_costo
+INNER JOIN AREAS              AS a  ON a.id_area         = cc.id_area
+WHERE v.nombre_version = N'Presupuesto inicial'
+  AND pe.anio = 2026
+GROUP BY a.nombre_area, cc.id_centro_costo, cc.codigo, cc.nombre
+ORDER BY a.nombre_area, presupuesto_anual DESC;
+
+
+
+/*2. Cuentas con gasto real alto en el primer trimestre*/
+SELECT cu.codigo_cuenta,
+       cu.nombre_cuenta,
+       COUNT(*)            AS num_documentos,
+       SUM(g.monto_real)   AS gasto_real_1t
+FROM GASTO_REAL AS g
+INNER JOIN CUENTAS  AS cu ON cu.id_cuenta  = g.id_cuenta
+INNER JOIN PERIODOS AS pe ON pe.id_periodo = g.id_periodo
+WHERE pe.anio = 2026
+  AND pe.trimestre = 1
+GROUP BY cu.id_cuenta, cu.codigo_cuenta, cu.nombre_cuenta
+HAVING SUM(g.monto_real) > 150000
+ORDER BY gasto_real_1t DESC;
+
+/*3. Cantidad de centros de costo por área*/
+SELECT a.nombre_area,
+       a.gerencia,
+       COUNT(cc.id_centro_costo) AS num_centros
+FROM AREAS AS a
+LEFT JOIN CENTRO_COSTO AS cc ON cc.id_area = a.id_area
+GROUP BY a.id_area, a.nombre_area, a.gerencia
+ORDER BY num_centros DESC, a.nombre_area;
+
+
+
+
+/*4. Semáforo de ejecución por centro y cuenta*/
+
+WITH pres_agg AS (
+    SELECT p.id_centro_costo, p.id_cuenta, SUM(p.monto_presupuesto) AS presupuesto
+    FROM PRESUPUESTO AS p
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = p.id_periodo
+    WHERE p.id_version = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Presupuesto inicial')
+      AND pe.anio = 2026
+      AND pe.mes BETWEEN 1 AND 9
+    GROUP BY p.id_centro_costo, p.id_cuenta
+),
+gasto_agg AS (
+    SELECT g.id_centro_costo, g.id_cuenta, SUM(g.monto_real) AS gasto_real
+    FROM GASTO_REAL AS g
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = g.id_periodo
+    WHERE pe.anio = 2026
+      AND pe.mes BETWEEN 1 AND 9
+    GROUP BY g.id_centro_costo, g.id_cuenta
+),
+desv AS (
+    SELECT pr.id_centro_costo,
+           pr.id_cuenta,
+           pr.presupuesto,
+           ISNULL(g.gasto_real, 0) AS gasto_real,
+           ISNULL(g.gasto_real, 0) - pr.presupuesto AS desviacion,
+           100.0 * (ISNULL(g.gasto_real, 0) - pr.presupuesto) / NULLIF(pr.presupuesto, 0) AS pct_desviacion
+    FROM pres_agg AS pr
+    LEFT JOIN gasto_agg AS g
+        ON g.id_centro_costo = pr.id_centro_costo
+       AND g.id_cuenta       = pr.id_cuenta
+)
+SELECT TOP (15)
+       cc.codigo,
+       cc.nombre AS centro_costo,
+       cu.nombre_cuenta,
+       d.presupuesto,
+       d.gasto_real,
+       d.desviacion,
+       CAST(d.pct_desviacion AS DECIMAL(8,2)) AS pct_desviacion,
+       CASE WHEN d.pct_desviacion >  10 THEN N'Sobreejecución'
+            WHEN d.pct_desviacion < -10 THEN N'Subejecución'
+            ELSE N'Dentro de rango'
+       END AS estado
+FROM desv AS d
+INNER JOIN CENTRO_COSTO AS cc ON cc.id_centro_costo = d.id_centro_costo
+INNER JOIN CUENTAS      AS cu ON cu.id_cuenta       = d.id_cuenta
+ORDER BY d.desviacion DESC;
+
+/*5. Los 2 centros más desviados de cada área
+*/
+WITH pres_cc AS (
+    SELECT p.id_centro_costo, SUM(p.monto_presupuesto) AS presupuesto
+    FROM PRESUPUESTO AS p
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = p.id_periodo
+    WHERE p.id_version = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Presupuesto inicial')
+      AND pe.anio = 2026
+      AND pe.mes BETWEEN 1 AND 9
+    GROUP BY p.id_centro_costo
+),
+gasto_cc AS (
+    SELECT g.id_centro_costo, SUM(g.monto_real) AS gasto_real
+    FROM GASTO_REAL AS g
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = g.id_periodo
+    WHERE pe.anio = 2026
+      AND pe.mes BETWEEN 1 AND 9
+    GROUP BY g.id_centro_costo
+),
+desv_cc AS (
+    SELECT cc.id_centro_costo,
+           cc.nombre AS centro_costo,
+           a.id_area,
+           a.nombre_area,
+           pr.presupuesto,
+           ISNULL(g.gasto_real, 0) AS gasto_real,
+           ISNULL(g.gasto_real, 0) - pr.presupuesto AS desviacion
+    FROM CENTRO_COSTO AS cc
+    INNER JOIN AREAS   AS a  ON a.id_area = cc.id_area
+    INNER JOIN pres_cc AS pr ON pr.id_centro_costo = cc.id_centro_costo
+    LEFT  JOIN gasto_cc AS g ON g.id_centro_costo  = cc.id_centro_costo
+),
+ranking AS (
+    SELECT d.*,
+           ROW_NUMBER() OVER (PARTITION BY d.id_area ORDER BY d.desviacion DESC) AS pos_en_area,
+           RANK()       OVER (ORDER BY d.desviacion DESC)                        AS pos_global
+    FROM desv_cc AS d
+)
+SELECT nombre_area, centro_costo, presupuesto, gasto_real, desviacion, pos_en_area, pos_global
+FROM ranking
+WHERE pos_en_area <= 2
+ORDER BY nombre_area, pos_en_area;
+
+
+/*6. Variación mensual del gasto por centro*/
+
+WITH gasto_mes AS (
+    SELECT g.id_centro_costo, pe.mes, SUM(g.monto_real) AS gasto
+    FROM GASTO_REAL AS g
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = g.id_periodo
+    WHERE pe.anio = 2026
+    GROUP BY g.id_centro_costo, pe.mes
+),
+tendencia AS (
+    SELECT id_centro_costo,
+           mes,
+           gasto,
+           LAG(gasto) OVER (PARTITION BY id_centro_costo ORDER BY mes) AS gasto_mes_anterior,
+           AVG(gasto) OVER (PARTITION BY id_centro_costo ORDER BY mes
+                            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)  AS promedio_movil_3m
+    FROM gasto_mes
+)
+SELECT cc.nombre AS centro_costo,
+       t.mes,
+       t.gasto,
+       t.gasto_mes_anterior,
+       t.gasto - t.gasto_mes_anterior AS variacion,
+       CAST(100.0 * (t.gasto - t.gasto_mes_anterior) / NULLIF(t.gasto_mes_anterior, 0) AS DECIMAL(8,2)) AS pct_variacion,
+       CAST(t.promedio_movil_3m AS DECIMAL(18,2)) AS promedio_movil_3m,
+       CASE WHEN t.gasto_mes_anterior IS NOT NULL
+             AND t.gasto > 1.25 * t.gasto_mes_anterior
+            THEN N'ALERTA' ELSE N'' END AS alerta
+FROM tendencia AS t
+INNER JOIN CENTRO_COSTO AS cc ON cc.id_centro_costo = t.id_centro_costo
+ORDER BY cc.nombre, t.mes;
+
+
+/*7. Matriz de ejecución por área y trimestre
+*/
+WITH pres_at AS (
+    SELECT cc.id_area, pe.trimestre, SUM(p.monto_presupuesto) AS presupuesto
+    FROM PRESUPUESTO AS p
+    INNER JOIN PERIODOS     AS pe ON pe.id_periodo      = p.id_periodo
+    INNER JOIN CENTRO_COSTO AS cc ON cc.id_centro_costo = p.id_centro_costo
+    WHERE p.id_version = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Presupuesto inicial')
+      AND pe.anio = 2026
+      AND pe.mes BETWEEN 1 AND 9
+    GROUP BY cc.id_area, pe.trimestre
+),
+gasto_at AS (
+    SELECT cc.id_area, pe.trimestre, SUM(g.monto_real) AS gasto_real
+    FROM GASTO_REAL AS g
+    INNER JOIN PERIODOS     AS pe ON pe.id_periodo      = g.id_periodo
+    INNER JOIN CENTRO_COSTO AS cc ON cc.id_centro_costo = g.id_centro_costo
+    WHERE pe.anio = 2026
+      AND pe.mes BETWEEN 1 AND 9
+    GROUP BY cc.id_area, pe.trimestre
+),
+ejec AS (
+    SELECT pr.id_area,
+           pr.trimestre,
+           100.0 * ISNULL(g.gasto_real, 0) / NULLIF(pr.presupuesto, 0) AS pct_ejecucion
+    FROM pres_at AS pr
+    LEFT JOIN gasto_at AS g
+        ON g.id_area   = pr.id_area
+       AND g.trimestre = pr.trimestre
+),
+pivotado AS (
+    SELECT id_area,
+           MAX(CASE WHEN trimestre = 1 THEN pct_ejecucion END) AS ejec_q1,
+           MAX(CASE WHEN trimestre = 2 THEN pct_ejecucion END) AS ejec_q2,
+           MAX(CASE WHEN trimestre = 3 THEN pct_ejecucion END) AS ejec_q3
+    FROM ejec
+    GROUP BY id_area
+)
+SELECT a.nombre_area,
+       CAST(p.ejec_q1 AS DECIMAL(6,1)) AS ejec_q1,
+       CAST(p.ejec_q2 AS DECIMAL(6,1)) AS ejec_q2,
+       CAST(p.ejec_q3 AS DECIMAL(6,1)) AS ejec_q3,
+       CASE WHEN p.ejec_q3 > 110 THEN N'Rojo'
+            WHEN p.ejec_q3 > 100 THEN N'Amarillo'
+            ELSE N'Verde' END AS semaforo_q3,
+       CASE WHEN p.ejec_q3 > p.ejec_q2 AND p.ejec_q2 > p.ejec_q1
+            THEN N'Creciente' ELSE N'No creciente' END AS tendencia
+FROM pivotado AS p
+INNER JOIN AREAS AS a ON a.id_area = p.id_area
+ORDER BY p.ejec_q3 DESC;
+
+
+/*8. Ejecución acumulada (YTD) y proyección de cierre*/
+
+WITH pres_mes AS (
+    SELECT pe.mes, SUM(p.monto_presupuesto) AS presupuesto
+    FROM PRESUPUESTO AS p
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = p.id_periodo
+    WHERE p.id_version = (SELECT id_version FROM VERSIONPRESUPUESTO WHERE nombre_version = N'Presupuesto inicial')
+      AND pe.anio = 2026
+    GROUP BY pe.mes
+),
+gasto_mes AS (
+    SELECT pe.mes, SUM(g.monto_real) AS gasto_real
+    FROM GASTO_REAL AS g
+    INNER JOIN PERIODOS AS pe ON pe.id_periodo = g.id_periodo
+    WHERE pe.anio = 2026
+    GROUP BY pe.mes
+),
+acum AS (
+    SELECT pm.mes,
+           pm.presupuesto,
+           gm.gasto_real,
+           SUM(pm.presupuesto) OVER (ORDER BY pm.mes
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS presupuesto_acum,
+           SUM(ISNULL(gm.gasto_real, 0)) OVER (ORDER BY pm.mes
+                                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS real_acum,
+           SUM(pm.presupuesto) OVER () AS presupuesto_anual
+    FROM pres_mes AS pm
+    LEFT JOIN gasto_mes AS gm ON gm.mes = pm.mes
+)
+SELECT mes,
+       presupuesto,
+       gasto_real,
+       presupuesto_acum,
+       real_acum,
+       CAST(100.0 * real_acum / NULLIF(presupuesto_acum, 0) AS DECIMAL(6,1)) AS pct_ejecucion_acum,
+       CAST(real_acum * 12.0 / mes AS DECIMAL(20,2))                         AS proyeccion_cierre_anual,
+       presupuesto_anual,
+       CAST(real_acum * 12.0 / mes - presupuesto_anual AS DECIMAL(20,2))     AS desviacion_proyectada
+FROM acum
+WHERE gasto_real IS NOT NULL
+ORDER BY mes;
+
+/*9. Real vs. presupuesto vigente (inicial o forecast)
+*/
+WITH pres_rank AS (
+    SELECT p.id_centro_costo,
+           p.id_cuenta,
+           p.id_periodo,
+           p.monto_presupuesto,
+           v.nombre_version,
+           ROW_NUMBER() OVER (PARTITION BY p.id_centro_costo, p.id_cuenta, p.id_periodo
+                              ORDER BY v.fecha_aprobacion DESC) AS rn
+    FROM PRESUPUESTO AS p
+    INNER JOIN VERSIONPRESUPUESTO AS v ON v.id_version = p.id_version
+),
+pres_vigente AS (
+    SELECT id_centro_costo, id_cuenta, id_periodo, monto_presupuesto, nombre_version
+    FROM pres_rank
+    WHERE rn = 1
+),
+gasto_agg AS (
+    SELECT id_centro_costo, id_cuenta, id_periodo, SUM(monto_real) AS gasto_real
+    FROM GASTO_REAL
+    GROUP BY id_centro_costo, id_cuenta, id_periodo
+)
+SELECT cc.nombre AS centro_costo,
+       SUM(pv.monto_presupuesto) AS presupuesto_vigente,
+       SUM(CASE WHEN pv.nombre_version = N'Forecast Q3' THEN 1 ELSE 0 END) AS lineas_revisadas_forecast,
+       SUM(ISNULL(g.gasto_real, 0)) AS gasto_real,
+       SUM(ISNULL(g.gasto_real, 0)) - SUM(pv.monto_presupuesto) AS desviacion
+FROM pres_vigente AS pv
+INNER JOIN PERIODOS     AS pe ON pe.id_periodo       = pv.id_periodo
+INNER JOIN CENTRO_COSTO AS cc ON cc.id_centro_costo  = pv.id_centro_costo
+LEFT  JOIN gasto_agg    AS g  ON g.id_centro_costo   = pv.id_centro_costo
+                             AND g.id_cuenta         = pv.id_cuenta
+                             AND g.id_periodo        = pv.id_periodo
+WHERE pe.anio = 2026
+  AND pe.mes BETWEEN 7 AND 9
+GROUP BY cc.id_centro_costo, cc.nombre
+ORDER BY desviacion DESC;
+
+/*10. Vista reutilizable y procedimiento almacenado*/
+
+CREATE OR ALTER VIEW vw_desviacion_mensual
+AS
+WITH gasto_agg AS (
+    SELECT id_centro_costo, id_cuenta, id_periodo, SUM(monto_real) AS gasto_real
+    FROM GASTO_REAL
+    GROUP BY id_centro_costo, id_cuenta, id_periodo
+)
+SELECT p.id_centro_costo,
+       p.id_cuenta,
+       p.id_periodo,
+       pe.anio,
+       pe.mes,
+       p.monto_presupuesto                                  AS presupuesto,
+       ISNULL(g.gasto_real, 0)                              AS gasto_real,
+       ISNULL(g.gasto_real, 0) - p.monto_presupuesto        AS desviacion
+FROM PRESUPUESTO AS p
+INNER JOIN VERSIONPRESUPUESTO AS v  ON v.id_version  = p.id_version
+INNER JOIN PERIODOS           AS pe ON pe.id_periodo = p.id_periodo
+LEFT  JOIN gasto_agg          AS g  ON g.id_centro_costo = p.id_centro_costo
+                                   AND g.id_cuenta       = p.id_cuenta
+                                   AND g.id_periodo      = p.id_periodo
+WHERE v.nombre_version = N'Presupuesto inicial';
+GO
+
+/*Procedimiento almacenado*/
+CREATE OR ALTER PROCEDURE usp_top_desviaciones
+    @anio       INT,
+    @mes_desde  INT,
+    @mes_hasta  INT,
+    @top        INT = 10
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT TOP (@top)
+           cc.codigo,
+           cc.nombre AS centro_costo,
+           SUM(v.presupuesto) AS presupuesto,
+           SUM(v.gasto_real)  AS gasto_real,
+           SUM(v.desviacion)  AS desviacion,
+           CAST(100.0 * SUM(v.desviacion) / NULLIF(SUM(v.presupuesto), 0) AS DECIMAL(8,2)) AS pct_desviacion
+    FROM vw_desviacion_mensual AS v
+    INNER JOIN CENTRO_COSTO AS cc ON cc.id_centro_costo = v.id_centro_costo
+    WHERE v.anio = @anio
+      AND v.mes BETWEEN @mes_desde AND @mes_hasta
+    GROUP BY cc.id_centro_costo, cc.codigo, cc.nombre
+    ORDER BY SUM(v.desviacion) DESC;
+END;
+go
+
+EXEC usp_top_desviaciones @anio = 2026, @mes_desde = 1, @mes_hasta = 9, @top = 5;
